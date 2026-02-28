@@ -1,4 +1,6 @@
 FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
+ARG UID=1159850719
+ARG GID=1159800513
 
 # Install Bun (required for build scripts)
 RUN curl -fsSL https://bun.sh/install | bash
@@ -6,8 +8,11 @@ ENV PATH="/root/.bun/bin:${PATH}"
 
 RUN corepack enable
 
+RUN groupadd -g $GID appgroup \
+    && useradd -m -u $UID -g $GID appuser
+
 WORKDIR /app
-RUN chown node:node /app
+RUN chown appuser:appgroup /app
 
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
 RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
@@ -17,15 +22,14 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
-COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY --chown=node:node ui/package.json ./ui/package.json
-COPY --chown=node:node patches ./patches
-COPY --chown=node:node scripts ./scripts
+COPY --chown=appuser:appgroup package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY --chown=appuser:appgroup ui/package.json ./ui/package.json
+COPY --chown=appuser:appgroup patches ./patches
+COPY --chown=appuser:appgroup scripts ./scripts
 
-USER node
-# Reduce OOM risk on low-memory hosts during dependency installation.
-# Docker builds on small VMs may otherwise fail with "Killed" (exit 137).
-RUN NODE_OPTIONS=--max-old-space-size=2048 pnpm install --frozen-lockfile
+
+USER appuser
+RUN pnpm install --frozen-lockfile
 
 # Optionally install Chromium and Xvfb for browser automation.
 # Build with: docker build --build-arg OPENCLAW_INSTALL_BROWSER=1 ...
@@ -44,24 +48,21 @@ RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
-USER node
-COPY --chown=node:node . .
+USER appuser
+COPY --chown=appuser:appgroup . .
 RUN pnpm build
 # Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
-
-# Expose the CLI binary without requiring npm global writes as non-root.
 USER root
-RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
- && chmod 755 /app/openclaw.mjs
-
+RUN chmod -R a+rX /app
+USER appuser
 ENV NODE_ENV=production
 
 # Security hardening: Run as non-root user
 # The node:22-bookworm image includes a 'node' user (uid 1000)
 # This reduces the attack surface by preventing container escape via root privileges
-USER node
+USER appuser
 
 # Start gateway server with default config.
 # Binds to loopback (127.0.0.1) by default for security.
