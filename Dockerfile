@@ -1,18 +1,77 @@
 FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
+
 ARG UID=1159850719
 ARG GID=1159800513
 
-# Install Bun (required for build scripts)
+# -------------------------------------------------
+# Base system dependencies
+# -------------------------------------------------
+
+USER root
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        file \
+        git \
+        procps \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# -------------------------------------------------
+# Install Bun (build tooling)
+# -------------------------------------------------
+
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
 RUN corepack enable
 
-RUN groupadd -g $GID appgroup \
-    && useradd -m -u $UID -g $GID appuser
+# -------------------------------------------------
+# Create application user
+# -------------------------------------------------
+
+RUN groupadd -g $GID appgroup && \
+    useradd -m -u $UID -g $GID appuser
 
 WORKDIR /app
 RUN chown appuser:appgroup /app
+
+# -------------------------------------------------
+# Install Homebrew (Linux)
+# -------------------------------------------------
+
+# Create linuxbrew user
+RUN useradd -m linuxbrew
+
+USER linuxbrew
+
+# HOME aqui é automaticamente /home/linuxbrew
+RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+
+RUN brew update
+
+USER root
+
+# Permitir que appuser use o brew
+RUN chown -R appuser:appgroup /home/linuxbrew
+
+# -------------------------------------------------
+# Ajustar HOME final para runtime
+# -------------------------------------------------
+
+ENV HOME=/home/appuser
+RUN mkdir -p /home/appuser/.cache && \
+    chown -R appuser:appgroup /home/appuser
+
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+
+# -------------------------------------------------
+# Optional APT packages
+# -------------------------------------------------
 
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
 RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
@@ -22,52 +81,55 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
+# -------------------------------------------------
+# Install Node dependencies
+# -------------------------------------------------
+
 COPY --chown=appuser:appgroup package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY --chown=appuser:appgroup ui/package.json ./ui/package.json
 COPY --chown=appuser:appgroup patches ./patches
 COPY --chown=appuser:appgroup scripts ./scripts
 
-
 USER appuser
 RUN pnpm install --frozen-lockfile
 
-# Optionally install Chromium and Xvfb for browser automation.
-# Build with: docker build --build-arg OPENCLAW_INSTALL_BROWSER=1 ...
-# Adds ~300MB but eliminates the 60-90s Playwright install on every container start.
-# Must run after pnpm install so playwright-core is available in node_modules.
+# -------------------------------------------------
+# Optional Playwright browser install
+# -------------------------------------------------
+
 USER root
 ARG OPENCLAW_INSTALL_BROWSER=""
 RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
       apt-get update && \
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
-      mkdir -p /home/node/.cache/ms-playwright && \
-      PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright \
-      node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
-      chown -R node:node /home/node/.cache/ms-playwright && \
+      mkdir -p /home/appuser/.cache/ms-playwright && \
+      chown -R appuser:appgroup /home/appuser/.cache && \
+      su -s /bin/sh appuser -c "PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright node /app/node_modules/playwright-core/cli.js install --with-deps chromium" && \
       apt-get clean && \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
 USER appuser
+
+# -------------------------------------------------
+# Build project
+# -------------------------------------------------
+
 COPY --chown=appuser:appgroup . .
+
 RUN pnpm build
-# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
+
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
+
 USER root
 RUN chmod -R a+rX /app
 USER appuser
+
 ENV NODE_ENV=production
 
-# Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
-USER appuser
+# -------------------------------------------------
+# Start gateway
+# -------------------------------------------------
 
-# Start gateway server with default config.
-# Binds to loopback (127.0.0.1) by default for security.
-#
-# For container platforms requiring external health checks:
-#   1. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD env var
-#   2. Override CMD: ["node","openclaw.mjs","gateway","--allow-unconfigured","--bind","lan"]
 CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
